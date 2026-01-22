@@ -1,0 +1,267 @@
+---
+- name: Bootstrap Ubuntu server
+  hosts: servers
+  become: true
+  gather_facts: true
+
+  vars:
+    initial_user: "{{ ansible_user | default('root') }}"
+
+  vars_files:
+    - vars/defaults.yml
+
+  pre_tasks:
+    - name: Check for local overrides
+      ansible.builtin.stat:
+        path: vars/local.yml
+      register: local_vars_stat
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Load local overrides if present
+      ansible.builtin.include_vars:
+        file: vars/local.yml
+      when: local_vars_stat.stat.exists
+
+    - name: Resolve create_user auto mode
+      ansible.builtin.set_fact:
+        create_user_resolved: "{{ initial_user == 'root' }}"
+      when: create_user == 'auto'
+
+    - name: Resolve create_user explicit value
+      ansible.builtin.set_fact:
+        create_user_resolved: "{{ create_user | bool }}"
+      when: create_user != 'auto'
+
+    - name: Resolve primary user
+      ansible.builtin.set_fact:
+        primary_user: "{{ new_user if create_user_resolved else initial_user }}"
+
+    - name: Validate user settings
+      ansible.builtin.assert:
+        that:
+          - new_user | length > 0
+        fail_msg: "new_user must be set"
+      when: create_user_resolved
+
+    - name: Validate password settings for new user
+      ansible.builtin.assert:
+        that:
+          - new_user_password | length > 0
+        fail_msg: "new_user_password must be set when create_user=true"
+      when: create_user_resolved
+
+    - name: Validate public key path exists
+      ansible.builtin.stat:
+        path: "{{ local_public_key_path }}"
+      register: local_public_key_stat
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: copy_ssh_key | bool
+
+    - name: Ensure public key exists on controller
+      ansible.builtin.assert:
+        that:
+          - local_public_key_stat.stat.exists
+        fail_msg: "local_public_key_path does not exist on controller"
+      when: copy_ssh_key | bool
+
+  tasks:
+    - name: Change root password when provided
+      ansible.builtin.user:
+        name: root
+        password: "{{ new_root_password | password_hash('sha512') }}"
+      when: new_root_password | length > 0
+
+    - name: Ensure sudo group exists
+      ansible.builtin.group:
+        name: sudo
+        state: present
+
+    - name: Create user with sudo
+      ansible.builtin.user:
+        name: "{{ new_user }}"
+        groups: sudo
+        append: true
+        shell: /bin/bash
+        password: "{{ new_user_password | password_hash('sha512') }}"
+        create_home: true
+      when: create_user_resolved
+
+    - name: Add public key for primary user
+      ansible.builtin.authorized_key:
+        user: "{{ primary_user }}"
+        key: "{{ lookup('file', local_public_key_path) }}"
+      when: copy_ssh_key | bool
+
+    - name: Switch connection to primary user
+      ansible.builtin.set_fact:
+        ansible_user: "{{ primary_user }}"
+        ansible_become_password: "{{ new_user_password }}"
+      when: create_user_resolved
+
+    - name: Reconnect as primary user
+      ansible.builtin.include_tasks: tasks/reset_connection.yml
+      when: create_user_resolved
+
+    - name: Update apt cache and upgrade
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+        cache_valid_time: 3600
+
+    - name: Install base packages
+      ansible.builtin.apt:
+        name:
+          - htop
+          - tcpdump
+          - tree
+          - tmux
+          - ripgrep
+          - fd-find
+          - nload
+          - vim
+          - curl
+          - ca-certificates
+          - gnupg
+          - lsb-release
+        state: present
+
+    - name: Set timezone
+      ansible.builtin.command: "timedatectl set-timezone {{ timezone }}"
+      changed_when: true
+
+    - name: Configure sshd port
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?Port '
+        line: "Port {{ ssh_port }}"
+      notify: Restart ssh
+
+    - name: Disable root login
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin '
+        line: 'PermitRootLogin no'
+      notify: Restart ssh
+
+    - name: Disable password authentication
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication '
+        line: 'PasswordAuthentication no'
+      notify: Restart ssh
+
+    - name: Ensure public key authentication
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PubkeyAuthentication '
+        line: 'PubkeyAuthentication yes'
+      notify: Restart ssh
+
+    - name: Disable keyboard-interactive authentication
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?KbdInteractiveAuthentication '
+        line: 'KbdInteractiveAuthentication no'
+      notify: Restart ssh
+
+    - name: Install fail2ban
+      ansible.builtin.apt:
+        name: fail2ban
+        state: present
+
+    - name: Enable fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        enabled: true
+        state: started
+
+    - name: Install iptables persistence
+      ansible.builtin.apt:
+        name:
+          - iptables-persistent
+          - netfilter-persistent
+        state: present
+
+    - name: Allow loopback traffic
+      ansible.builtin.iptables:
+        chain: INPUT
+        in_interface: lo
+        jump: ACCEPT
+        state: present
+        action: insert
+        rule_num: 1
+
+    - name: Allow established connections
+      ansible.builtin.iptables:
+        chain: INPUT
+        ctstate: ESTABLISHED,RELATED
+        jump: ACCEPT
+        state: present
+        action: insert
+        rule_num: 2
+
+    - name: Allow SSH on custom port
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ ssh_port }}"
+        jump: ACCEPT
+        comment: "Allow SSH"
+        state: present
+        action: insert
+        rule_num: 3
+
+    - name: Set default INPUT policy to DROP
+      ansible.builtin.iptables:
+        chain: INPUT
+        policy: DROP
+
+    - name: Set default OUTPUT policy to ACCEPT
+      ansible.builtin.iptables:
+        chain: OUTPUT
+        policy: ACCEPT
+
+    - name: Save iptables rules
+      ansible.builtin.command: netfilter-persistent save
+      changed_when: true
+
+    - name: Install Docker
+      ansible.builtin.get_url:
+        url: https://get.docker.com
+        dest: /tmp/get-docker.sh
+        mode: '0755'
+      when: install_docker | bool
+
+    - name: Run Docker install script
+      ansible.builtin.command: sh /tmp/get-docker.sh
+      args:
+        creates: /usr/bin/docker
+      when: install_docker | bool
+
+    - name: Ensure docker group exists
+      ansible.builtin.group:
+        name: docker
+        state: present
+      when: install_docker | bool
+
+    - name: Add primary user to docker group
+      ansible.builtin.user:
+        name: "{{ primary_user }}"
+        groups: docker
+        append: true
+      when: install_docker | bool
+
+    - name: Show SSH connection command
+      ansible.builtin.debug:
+        msg: "Connect: ssh -p {{ ssh_port }} {{ primary_user }}@{{ ansible_host | default(inventory_hostname) }}"
+
+  handlers:
+    - name: Restart ssh
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+        daemon_reload: true

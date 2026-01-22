@@ -1,0 +1,11 @@
+---
+# Example defaults. Copy to vars/local.yml and customize.
+new_user: deploy
+new_user_password: "ChangeMe123!"
+new_root_password: "Change_me_123!"
+ssh_port: 38575
+local_public_key_path: "~/.ssh/id_ed25519.pub"
+timezone: "Europe/London"
+create_user: auto
+copy_ssh_key: true
+install_docker: true
