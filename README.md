@@ -4,6 +4,10 @@ Opinionated Ansible bootstrap for fresh Ubuntu servers: create or reuse a non-ro
 
 This playbook configures an Ubuntu server over SSH. It can start from `root` or an existing non-root user.
 
+## Prerequisites
+- Ansible installed on your local machine.
+- SSH access to the server (key or password).
+
 ## What it does
 - Change root password (if provided)
 - Create a new sudo user (optional, default when connecting as root)
