@@ -52,9 +52,20 @@
         fail_msg: "new_user_password must be set when create_user=true"
       when: create_user_resolved
 
+    - name: Resolve effective public key path
+      vars:
+        ssh_private_key_file_safe: "{{ ansible_ssh_private_key_file | default('') }}"
+      ansible.builtin.set_fact:
+        effective_public_key_path: >-
+          {{
+            (ssh_private_key_file_safe | length > 0)
+            | ternary(ssh_private_key_file_safe ~ '.pub', local_public_key_path)
+          }}
+      when: copy_ssh_key | bool
+
     - name: Validate public key path exists
       ansible.builtin.stat:
-        path: "{{ local_public_key_path }}"
+        path: "{{ effective_public_key_path }}"
       register: local_public_key_stat
       delegate_to: localhost
       become: false
@@ -65,7 +76,7 @@
       ansible.builtin.assert:
         that:
           - local_public_key_stat.stat.exists
-        fail_msg: "local_public_key_path does not exist on controller"
+        fail_msg: "effective_public_key_path does not exist on controller"
       when: copy_ssh_key | bool
 
   tasks:
@@ -93,7 +104,7 @@
     - name: Add public key for primary user
       ansible.builtin.authorized_key:
         user: "{{ primary_user }}"
-        key: "{{ lookup('file', local_public_key_path) }}"
+        key: "{{ lookup('file', effective_public_key_path) }}"
       when: copy_ssh_key | bool
 
     - name: Switch connection to primary user
@@ -104,6 +115,12 @@
 
     - name: Reconnect as primary user
       ansible.builtin.include_tasks: tasks/reset_connection.yml
+      when: create_user_resolved
+
+    - name: Wait for connection after user switch
+      ansible.builtin.wait_for_connection:
+        delay: 2
+        timeout: 60
       when: create_user_resolved
 
     - name: Update apt cache and upgrade
