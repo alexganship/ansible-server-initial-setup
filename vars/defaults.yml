@@ -1,11 +1,55 @@
 ---
-# Example defaults. Copy to vars/local.yml and customize.
-new_user: deploy
-new_user_password: "ChangeMe123!"
-new_root_password: "Change_me_123!"
+# Controller key manually installed for root on every fresh server.
+controller_private_key_path: "{{ lookup('ansible.builtin.env', 'HOME') }}/.ssh/id_ed25519"
+controller_public_key_path: "{{ controller_private_key_path }}.pub"
+controller_known_hosts_file: "{{ lookup('ansible.builtin.env', 'HOME') }}/.ssh/known_hosts"
+ssh_strict_host_key_checking: accept-new
+ssh_connect_timeout: 7
+remote_python_interpreter: /usr/bin/python3
+
+# A managed server is always reached through this account and target port.
+managed_user: support
 ssh_port: 38575
-local_public_key_path: "~/.ssh/id_ed25519.pub"
-timezone: "Europe/London"
-create_user: auto
-copy_ssh_key: true
+
+# Set current_ssh_port per host when migrating an already-managed node from a
+# different custom port. Discovery probes ssh_port first, then this port.
+current_ssh_port: 22
+bootstrap_ssh_port: 22
+
+timezone: Europe/Moscow
+upgrade_packages: true
 install_docker: true
+manage_docker_repository: true
+manage_docker_firewall: true
+
+# Disable SSH forwarding unless a server explicitly needs TCP tunnels.
+allow_ssh_tcp_forwarding: false
+ssh_max_auth_tries: 3
+
+# SSH jail policy. Ban duration grows for repeat offenders, up to one week.
+fail2ban_maxretry: 5
+fail2ban_findtime: 600
+fail2ban_bantime: 3600
+fail2ban_bantime_increment: true
+fail2ban_bantime_maxtime: 604800
+
+# Optional console-only passwords. Put hashes in an encrypted vars/local.yml.
+# SSH password authentication remains disabled.
+manage_console_passwords: false
+root_console_password_hash: ""
+support_console_password_hash: ""
+
+base_packages:
+  - ca-certificates
+  - curl
+  - fd-find
+  - gnupg
+  - htop
+  - iptables
+  - lsb-release
+  - nload
+  - ripgrep
+  - tcpdump
+  - tmux
+  - tree
+  - vim

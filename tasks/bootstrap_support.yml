@@ -1,0 +1,113 @@
+---
+- name: Confirm the fresh-server connection is root
+  ansible.builtin.assert:
+    that:
+      - ansible_user == "root"
+    fail_msg: "Fresh-server bootstrap must begin through the root SSH key."
+
+- name: Ensure the sudo group exists
+  ansible.builtin.group:
+    name: sudo
+    state: present
+
+- name: Ensure sudo is installed before verification
+  ansible.builtin.apt:
+    name: sudo
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Ensure the support primary group exists
+  ansible.builtin.group:
+    name: "{{ managed_user }}"
+    state: present
+
+- name: Create the locked-password support account
+  ansible.builtin.user:
+    name: "{{ managed_user }}"
+    group: "{{ managed_user }}"
+    groups:
+      - sudo
+    append: false
+    shell: /bin/bash
+    create_home: true
+    password_lock: true
+    state: present
+
+- name: Ensure the support SSH directory exists
+  ansible.builtin.file:
+    path: "/home/{{ managed_user }}/.ssh"
+    state: directory
+    owner: "{{ managed_user }}"
+    group: "{{ managed_user }}"
+    mode: "0700"
+
+- name: Install the controller public key for support
+  ansible.builtin.lineinfile:
+    path: "/home/{{ managed_user }}/.ssh/authorized_keys"
+    line: "{{ lookup('ansible.builtin.file', controller_public_key_path_expanded) }}"
+    create: true
+    owner: "{{ managed_user }}"
+    group: "{{ managed_user }}"
+    mode: "0600"
+    state: present
+
+- name: Grant support passwordless sudo
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/90-{{ managed_user }}"
+    content: "{{ managed_user }} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Independently verify support key login and sudo
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -i
+      - "{{ controller_private_key_path_expanded }}"
+      - -p
+      - "{{ discovered_ssh_port | string }}"
+      - -o
+      - BatchMode=yes
+      - -o
+      - "ConnectTimeout={{ ssh_connect_timeout }}"
+      - -o
+      - "StrictHostKeyChecking={{ ssh_strict_host_key_checking }}"
+      - -o
+      - "UserKnownHostsFile={{ controller_known_hosts_file_expanded }}"
+      - "{{ managed_user }}@{{ ansible_host | default(inventory_hostname) }}"
+      - sudo -n /usr/bin/true
+  delegate_to: localhost
+  become: false
+  changed_when: false
+
+- name: Switch Ansible to the verified support account
+  ansible.builtin.set_fact:
+    ansible_user: "{{ managed_user }}"
+    ansible_port: "{{ discovered_ssh_port }}"
+
+- name: Reset the root SSH connection
+  ansible.builtin.meta: reset_connection
+
+- name: Wait for the support SSH connection
+  ansible.builtin.wait_for_connection:
+    delay: 1
+    timeout: 60
+
+- name: Confirm Ansible is connected as support
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/id
+      - -un
+  register: connected_user
+  changed_when: false
+
+- name: Require the expected managed identity
+  ansible.builtin.assert:
+    that:
+      - connected_user.stdout == managed_user
+    fail_msg: "The independent support connection did not become Ansible's active connection."

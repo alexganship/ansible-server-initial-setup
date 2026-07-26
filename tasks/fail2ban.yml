@@ -1,0 +1,50 @@
+---
+- name: Install fail2ban
+  ansible.builtin.apt:
+    name: fail2ban
+    state: present
+
+- name: Configure fail2ban for the managed SSH port
+  ansible.builtin.template:
+    src: fail2ban-sshd.local.j2
+    dest: /etc/fail2ban/jail.d/sshd.local
+    owner: root
+    group: root
+    mode: "0644"
+  register: fail2ban_sshd_config
+
+- name: Enable fail2ban with the current configuration
+  ansible.builtin.systemd:
+    name: fail2ban.service
+    enabled: true
+    state: "{{ 'restarted' if fail2ban_sshd_config.changed else 'started' }}"
+
+- name: Verify the fail2ban SSH jail
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/fail2ban-client
+      - status
+      - sshd
+  changed_when: false
+
+- name: Read the effective fail2ban SSH limits
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/fail2ban-client
+      - get
+      - sshd
+      - "{{ item }}"
+  loop:
+    - maxretry
+    - findtime
+    - bantime
+  register: effective_fail2ban_limits
+  changed_when: false
+
+- name: Require the effective fail2ban SSH limits
+  ansible.builtin.assert:
+    that:
+      - effective_fail2ban_limits.results[0].stdout | int == fail2ban_maxretry | int
+      - effective_fail2ban_limits.results[1].stdout | int == fail2ban_findtime | int
+      - effective_fail2ban_limits.results[2].stdout | int == fail2ban_bantime | int
+    fail_msg: "The running fail2ban SSH jail does not match the managed limits."

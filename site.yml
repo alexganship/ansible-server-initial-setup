@@ -1,284 +1,289 @@
 ---
-- name: Bootstrap Ubuntu server
+- name: Discover the safe SSH path for every server
   hosts: servers
-  become: true
-  gather_facts: true
-
-  vars:
-    initial_user: "{{ ansible_user | default('root') }}"
-
+  connection: local
+  gather_facts: false
+  become: false
   vars_files:
     - vars/defaults.yml
 
   pre_tasks:
-    - name: Check for local overrides
-      ansible.builtin.stat:
-        path: vars/local.yml
-      register: local_vars_stat
-      delegate_to: localhost
-      become: false
-      run_once: true
-
-    - name: Load local overrides if present
-      ansible.builtin.include_vars:
-        file: vars/local.yml
-      when: local_vars_stat.stat.exists
-
-    - name: Resolve create_user auto mode
-      ansible.builtin.set_fact:
-        create_user_resolved: "{{ initial_user == 'root' }}"
-      when: create_user == 'auto'
-
-    - name: Resolve create_user explicit value
-      ansible.builtin.set_fact:
-        create_user_resolved: "{{ create_user | bool }}"
-      when: create_user != 'auto'
-
-    - name: Resolve primary user
-      ansible.builtin.set_fact:
-        primary_user: "{{ new_user if create_user_resolved else initial_user }}"
-
-    - name: Validate user settings
-      ansible.builtin.assert:
-        that:
-          - new_user | length > 0
-        fail_msg: "new_user must be set"
-      when: create_user_resolved
-
-    - name: Validate password settings for new user
-      ansible.builtin.assert:
-        that:
-          - new_user_password | length > 0
-        fail_msg: "new_user_password must be set when create_user=true"
-      when: create_user_resolved
-
-    - name: Resolve effective public key path
-      vars:
-        ssh_private_key_file_safe: "{{ ansible_ssh_private_key_file | default('') }}"
-      ansible.builtin.set_fact:
-        effective_public_key_path: >-
-          {{
-            (ssh_private_key_file_safe | length > 0)
-            | ternary(ssh_private_key_file_safe ~ '.pub', local_public_key_path)
-          }}
-      when: copy_ssh_key | bool
-
-    - name: Validate public key path exists
-      ansible.builtin.stat:
-        path: "{{ effective_public_key_path }}"
-      register: local_public_key_stat
-      delegate_to: localhost
-      become: false
-      run_once: true
-      when: copy_ssh_key | bool
-
-    - name: Ensure public key exists on controller
-      ansible.builtin.assert:
-        that:
-          - local_public_key_stat.stat.exists
-        fail_msg: "effective_public_key_path does not exist on controller"
-      when: copy_ssh_key | bool
+    - name: Load optional local overrides
+      ansible.builtin.include_tasks: tasks/load_local_vars.yml
 
   tasks:
-    - name: Change root password when provided
-      ansible.builtin.user:
-        name: root
-        password: "{{ new_root_password | password_hash('sha512') }}"
-      when: new_root_password | length > 0
+    - name: Validate controller and connection settings
+      ansible.builtin.assert:
+        that:
+          - managed_user == "support"
+          - ssh_port | int >= 1
+          - ssh_port | int <= 65535
+          - current_ssh_port | int >= 1
+          - current_ssh_port | int <= 65535
+          - bootstrap_ssh_port | int >= 1
+          - bootstrap_ssh_port | int <= 65535
+          - controller_private_key_path | length > 0
+          - controller_public_key_path | length > 0
+          - remote_python_interpreter.startswith("/")
+          - (not install_docker | bool) or manage_docker_repository | bool
+          - ssh_max_auth_tries | int >= 1
+          - fail2ban_maxretry | int >= 1
+          - fail2ban_findtime | int >= 1
+          - fail2ban_bantime | int >= 1
+          - (fail2ban_bantime_maxtime | int) >= (fail2ban_bantime | int)
+        fail_msg: >-
+          Invalid bootstrap settings. managed_user must be support, SSH ports
+          and security limits must be valid, and Docker installation requires
+          repository management.
 
-    - name: Ensure sudo group exists
-      ansible.builtin.group:
-        name: sudo
-        state: present
-
-    - name: Create user with sudo
-      ansible.builtin.user:
-        name: "{{ new_user }}"
-        groups: sudo
-        append: true
-        shell: /bin/bash
-        password: "{{ new_user_password | password_hash('sha512') }}"
-        create_home: true
-      when: create_user_resolved
-
-    - name: Add public key for primary user
-      ansible.builtin.authorized_key:
-        user: "{{ primary_user }}"
-        key: "{{ lookup('file', effective_public_key_path) }}"
-      when: copy_ssh_key | bool
-
-    - name: Switch connection to primary user
+    - name: Resolve controller SSH paths
       ansible.builtin.set_fact:
-        ansible_user: "{{ primary_user }}"
-        ansible_become_password: "{{ new_user_password }}"
-      when: create_user_resolved
+        controller_private_key_path_expanded: "{{ controller_private_key_path }}"
+        controller_public_key_path_expanded: "{{ controller_public_key_path }}"
+        controller_known_hosts_file_expanded: "{{ controller_known_hosts_file }}"
 
-    - name: Reconnect as primary user
-      ansible.builtin.include_tasks: tasks/reset_connection.yml
-      when: create_user_resolved
+    - name: Check the controller private key
+      ansible.builtin.stat:
+        path: "{{ controller_private_key_path_expanded }}"
+      register: controller_private_key
 
-    - name: Wait for connection after user switch
-      ansible.builtin.wait_for_connection:
-        delay: 2
-        timeout: 60
-      when: create_user_resolved
+    - name: Check the controller public key
+      ansible.builtin.stat:
+        path: "{{ controller_public_key_path_expanded }}"
+      register: controller_public_key
 
-    - name: Update apt cache and upgrade
-      ansible.builtin.apt:
-        update_cache: true
-        upgrade: dist
-        cache_valid_time: 3600
+    - name: Require the shared controller key pair
+      ansible.builtin.assert:
+        that:
+          - controller_private_key.stat.exists
+          - controller_private_key.stat.isreg
+          - controller_public_key.stat.exists
+          - controller_public_key.stat.isreg
+        fail_msg: >-
+          The shared SSH key pair was not found. Manually install
+          {{ controller_public_key_path_expanded }} for root on fresh servers
+          before running this playbook.
 
-    - name: Install base packages
-      ansible.builtin.apt:
-        name:
-          - htop
-          - tcpdump
-          - tree
-          - tmux
-          - ripgrep
-          - fd-find
-          - nload
-          - vim
-          - curl
-          - ca-certificates
-          - gnupg
-          - lsb-release
-        state: present
+    - name: Probe support access on managed and current ports
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -i
+          - "{{ controller_private_key_path_expanded }}"
+          - -p
+          - "{{ item | string }}"
+          - -o
+          - BatchMode=yes
+          - -o
+          - "ConnectTimeout={{ ssh_connect_timeout }}"
+          - -o
+          - "StrictHostKeyChecking={{ ssh_strict_host_key_checking }}"
+          - -o
+          - "UserKnownHostsFile={{ controller_known_hosts_file_expanded }}"
+          - "{{ managed_user }}@{{ ansible_host | default(inventory_hostname) }}"
+          - sudo -n /usr/bin/true
+      loop: "{{ [ssh_port | int, current_ssh_port | int] }}"
+      register: managed_access_probes
+      changed_when: false
+      failed_when: false
+      check_mode: false
 
-    - name: Set timezone
-      ansible.builtin.command: "timedatectl set-timezone {{ timezone }}"
-      changed_when: true
+    - name: Select a working support port
+      ansible.builtin.set_fact:
+        discovered_managed_port: >-
+          {{
+            (
+              managed_access_probes.results
+              | selectattr('rc', 'equalto', 0)
+              | map(attribute='item')
+              | list
+              | first
+            ) | default('')
+          }}
 
-    - name: Configure sshd port
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?Port '
-        line: "Port {{ ssh_port }}"
-      notify: Restart ssh
+    - name: Probe root key access for a fresh server
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -i
+          - "{{ controller_private_key_path_expanded }}"
+          - -p
+          - "{{ bootstrap_ssh_port | string }}"
+          - -o
+          - BatchMode=yes
+          - -o
+          - "ConnectTimeout={{ ssh_connect_timeout }}"
+          - -o
+          - "StrictHostKeyChecking={{ ssh_strict_host_key_checking }}"
+          - -o
+          - "UserKnownHostsFile={{ controller_known_hosts_file_expanded }}"
+          - "root@{{ ansible_host | default(inventory_hostname) }}"
+          - /usr/bin/true
+      register: root_access_probe
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: discovered_managed_port | string | length == 0
 
-    - name: Disable root login
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?PermitRootLogin '
-        line: 'PermitRootLogin no'
-      notify: Restart ssh
+    - name: Stop when neither safe SSH path works
+      ansible.builtin.assert:
+        that:
+          - >-
+            discovered_managed_port | string | length > 0
+            or (root_access_probe.rc | default(1)) == 0
+        fail_msg: >-
+          No safe SSH path is available for {{ inventory_hostname }}.
+          Expected either {{ managed_user }} with passwordless sudo on port
+          {{ ssh_port }} or {{ current_ssh_port }}, or root key access on port
+          {{ bootstrap_ssh_port }}. No remote changes were made.
 
-    - name: Disable password authentication
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?PasswordAuthentication '
-        line: 'PasswordAuthentication no'
-      notify: Restart ssh
+    - name: Record the discovered server state
+      ansible.builtin.set_fact:
+        bootstrap_state: >-
+          {{
+            'managed'
+            if discovered_managed_port | string | length > 0
+            else 'fresh'
+          }}
+        discovered_ssh_port: >-
+          {{
+            discovered_managed_port
+            if discovered_managed_port | string | length > 0
+            else bootstrap_ssh_port
+          }}
+        ansible_user: >-
+          {{
+            managed_user
+            if discovered_managed_port | string | length > 0
+            else 'root'
+          }}
+        ansible_port: >-
+          {{
+            discovered_managed_port
+            if discovered_managed_port | string | length > 0
+            else bootstrap_ssh_port
+          }}
+        ansible_ssh_private_key_file: "{{ controller_private_key_path_expanded }}"
+        ansible_ssh_common_args: >-
+          -o StrictHostKeyChecking={{ ssh_strict_host_key_checking }}
+          -o UserKnownHostsFile={{ controller_known_hosts_file_expanded }}
 
-    - name: Ensure public key authentication
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?PubkeyAuthentication '
-        line: 'PubkeyAuthentication yes'
-      notify: Restart ssh
+    - name: Add the server to its execution group
+      ansible.builtin.group_by:
+        key: "bootstrap_state_{{ bootstrap_state }}"
 
-    - name: Disable keyboard-interactive authentication
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?KbdInteractiveAuthentication '
-        line: 'KbdInteractiveAuthentication no'
-      notify: Restart ssh
+    - name: Pin the interpreter for subsequent Ubuntu connections
+      ansible.builtin.set_fact:
+        ansible_python_interpreter: "{{ remote_python_interpreter }}"
 
-    - name: Install fail2ban
-      ansible.builtin.apt:
-        name: fail2ban
-        state: present
 
-    - name: Enable fail2ban
-      ansible.builtin.service:
-        name: fail2ban
-        enabled: true
-        state: started
+- name: Create and independently verify the support account
+  hosts: bootstrap_state_fresh
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+  become: false
+  vars_files:
+    - vars/defaults.yml
 
-    - name: Install iptables persistence
-      ansible.builtin.apt:
-        name:
-          - iptables-persistent
-          - netfilter-persistent
-        state: present
+  pre_tasks:
+    - name: Load optional local overrides
+      ansible.builtin.include_tasks: tasks/load_local_vars.yml
 
-    - name: Allow loopback traffic
-      ansible.builtin.iptables:
-        chain: INPUT
-        in_interface: lo
-        jump: ACCEPT
-        state: present
-        action: insert
-        rule_num: 1
+  tasks:
+    - name: Bootstrap the support account
+      ansible.builtin.include_tasks: tasks/bootstrap_support.yml
 
-    - name: Allow established connections
-      ansible.builtin.iptables:
-        chain: INPUT
-        ctstate: ESTABLISHED,RELATED
-        jump: ACCEPT
-        state: present
-        action: insert
-        rule_num: 2
 
-    - name: Allow SSH on custom port
-      ansible.builtin.iptables:
-        chain: INPUT
-        protocol: tcp
-        destination_port: "{{ ssh_port }}"
-        jump: ACCEPT
-        comment: "Allow SSH"
-        state: present
-        action: insert
-        rule_num: 3
+- name: Converge every server to the managed state
+  hosts: bootstrap_state_fresh:bootstrap_state_managed
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: true
+  become: true
+  vars_files:
+    - vars/defaults.yml
 
-    - name: Set default INPUT policy to DROP
-      ansible.builtin.iptables:
-        chain: INPUT
-        policy: DROP
+  pre_tasks:
+    - name: Load optional local overrides
+      ansible.builtin.include_tasks: tasks/load_local_vars.yml
 
-    - name: Set default OUTPUT policy to ACCEPT
-      ansible.builtin.iptables:
-        chain: OUTPUT
-        policy: ACCEPT
+    - name: Validate the managed connection and Ubuntu release
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["distribution"] == "Ubuntu"
+          - ansible_facts["distribution_release"] == "noble"
+          - ansible_user == managed_user
+          - ssh_port | int >= 1
+          - ssh_port | int <= 65535
+        fail_msg: >-
+          This playbook supports Ubuntu 24.04 LTS (Noble) nodes reached as
+          {{ managed_user }}.
 
-    - name: Save iptables rules
-      ansible.builtin.command: netfilter-persistent save
-      changed_when: true
+    - name: Verify passwordless sudo through Ansible
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/sudo
+          - -n
+          - /usr/bin/true
+      become: false
+      changed_when: false
 
-    - name: Install Docker
-      ansible.builtin.get_url:
-        url: https://get.docker.com
-        dest: /tmp/get-docker.sh
-        mode: '0755'
-      when: install_docker | bool
+  tasks:
+    - name: Normalize the Docker apt repository before any apt operation
+      ansible.builtin.include_tasks: tasks/docker_repository.yml
+      when: manage_docker_repository | bool
 
-    - name: Run Docker install script
-      ansible.builtin.command: sh /tmp/get-docker.sh
-      args:
-        creates: /usr/bin/docker
-      when: install_docker | bool
+    - name: Install and configure base system packages
+      ansible.builtin.include_tasks: tasks/base_system.yml
 
-    - name: Ensure docker group exists
-      ansible.builtin.group:
-        name: docker
-        state: present
-      when: install_docker | bool
+    - name: Apply kernel network hardening
+      ansible.builtin.include_tasks: tasks/sysctl.yml
 
-    - name: Add primary user to docker group
-      ansible.builtin.user:
-        name: "{{ primary_user }}"
-        groups: docker
-        append: true
-      when: install_docker | bool
+    - name: Open the safe SSH migration window
+      ansible.builtin.include_tasks: tasks/firewall_transition.yml
 
-    - name: Show SSH connection command
+    - name: Migrate and harden SSH
+      ansible.builtin.include_tasks: tasks/ssh.yml
+
+    - name: Configure optional console-only passwords
+      ansible.builtin.include_tasks: tasks/console_passwords.yml
+      when: manage_console_passwords | bool
+
+    - name: Finalize the persistent host firewall
+      ansible.builtin.include_tasks: tasks/firewall_final.yml
+
+    - name: Configure fail2ban
+      ansible.builtin.include_tasks: tasks/fail2ban.yml
+
+    - name: Install and constrain Docker networking
+      ansible.builtin.include_tasks: tasks/docker.yml
+      when: install_docker | bool or manage_docker_firewall | bool
+
+    - name: Check whether Ubuntu requires a reboot
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Report the final connection and reboot state
       ansible.builtin.debug:
-        msg: "Connect: ssh -p {{ ssh_port }} {{ primary_user }}@{{ ansible_host | default(inventory_hostname) }}"
+        msg:
+          - >-
+            Connect: ssh -i {{ controller_private_key_path_expanded }}
+            -p {{ ssh_port }} {{ managed_user }}@{{
+            ansible_host | default(inventory_hostname) }}
+          - >-
+            Reboot required: {{ reboot_required.stat.exists | bool }}.
+            This playbook never reboots automatically.
 
   handlers:
-    - name: Restart ssh
+    - name: Apply kernel network hardening policy
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/sysctl
+          - --system
+      changed_when: true
+
+    - name: Reload systemd
       ansible.builtin.systemd:
-        name: ssh
-        state: restarted
         daemon_reload: true

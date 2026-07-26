@@ -1,0 +1,12 @@
+---
+- name: Check for local variable overrides
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/vars/local.yml"
+  register: local_vars_file
+  delegate_to: localhost
+  become: false
+
+- name: Load local variable overrides
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/vars/local.yml"
+  when: local_vars_file.stat.exists

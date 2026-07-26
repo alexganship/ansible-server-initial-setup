@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+apply_policy() {
+  local firewall_command="$1"
+
+  if ! "${firewall_command}" -w -n -L DOCKER-USER >/dev/null 2>&1; then
+    return 0
+  fi
+
+  "${firewall_command}" -w -F DOCKER-USER
+  "${firewall_command}" -w -A DOCKER-USER \
+    -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  "${firewall_command}" -w -A DOCKER-USER -i lo -j ACCEPT
+  "${firewall_command}" -w -A DOCKER-USER -i 'docker+' -j ACCEPT
+  "${firewall_command}" -w -A DOCKER-USER -i 'br+' -j ACCEPT
+  "${firewall_command}" -w -A DOCKER-USER -j DROP
+}
+
+apply_policy /usr/sbin/iptables
+apply_policy /usr/sbin/ip6tables

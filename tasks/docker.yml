@@ -1,0 +1,100 @@
+---
+- name: Install Docker Engine and command-line plugins
+  ansible.builtin.apt:
+    name:
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-ce
+      - docker-ce-cli
+      - docker-compose-plugin
+    state: present
+    update_cache: true
+  when: install_docker | bool
+
+- name: Check whether Docker is installed
+  ansible.builtin.stat:
+    path: /usr/bin/docker
+  register: docker_binary
+
+- name: Require Docker before managing its firewall
+  ansible.builtin.assert:
+    that:
+      - docker_binary.stat.exists
+      - docker_binary.stat.isreg
+    fail_msg: >-
+      manage_docker_firewall is true, but /usr/bin/docker is not installed.
+      Enable install_docker or disable Docker firewall management.
+  when: manage_docker_firewall | bool
+
+- name: Enable and start Docker
+  ansible.builtin.systemd:
+    name: docker.service
+    enabled: true
+    state: started
+  when: docker_binary.stat.exists
+
+- name: Keep support outside the privileged docker group
+  ansible.builtin.user:
+    name: "{{ managed_user }}"
+    groups:
+      - sudo
+    append: false
+  when: docker_binary.stat.exists
+
+- name: Constrain Docker published-port traffic
+  when: manage_docker_firewall | bool
+  block:
+    - name: Install the Docker firewall policy script
+      ansible.builtin.template:
+        src: docker-user-firewall.sh.j2
+        dest: /usr/local/sbin/ansible-docker-user-firewall
+        owner: root
+        group: root
+        mode: "0755"
+      register: docker_firewall_script
+
+    - name: Install the Docker firewall systemd unit
+      ansible.builtin.template:
+        src: ansible-docker-firewall.service.j2
+        dest: /etc/systemd/system/ansible-docker-firewall.service
+        owner: root
+        group: root
+        mode: "0644"
+      register: docker_firewall_unit
+      notify: Reload systemd
+
+    - name: Apply pending systemd handler before starting the policy
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start the Docker firewall policy
+      ansible.builtin.systemd:
+        name: ansible-docker-firewall.service
+        enabled: true
+        state: >-
+          {{
+            'restarted'
+            if docker_firewall_script.changed or docker_firewall_unit.changed
+            else 'started'
+          }}
+
+    - name: Reconcile the live Docker firewall policy
+      ansible.builtin.command:
+        argv:
+          - /usr/local/sbin/ansible-docker-user-firewall
+      changed_when: false
+
+- name: Verify Docker through sudo
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - info
+      - --format
+      - "{{ '{{' }}.ServerVersion{{ '}}' }}"
+  register: docker_server_version
+  changed_when: false
+  when: docker_binary.stat.exists
+
+- name: Report the installed Docker server version
+  ansible.builtin.debug:
+    msg: "Docker server {{ docker_server_version.stdout }} is active."
+  when: docker_binary.stat.exists
