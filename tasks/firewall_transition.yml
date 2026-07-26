@@ -1,0 +1,217 @@
+---
+- name: Check whether UFW is installed
+  ansible.builtin.stat:
+    path: /usr/sbin/ufw
+  register: ufw_binary
+
+- name: Read the UFW state
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/ufw
+      - status
+  register: ufw_status
+  changed_when: false
+  when: ufw_binary.stat.exists
+
+- name: Disable UFW immediately before applying the managed policy
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/ufw
+      - --force
+      - disable
+  when:
+    - ufw_binary.stat.exists
+    - "'Status: active' in ufw_status.stdout"
+  changed_when: true
+
+- name: Ensure the managed IPv4 input chain exists
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    chain_management: true
+    state: present
+
+- name: Ensure the managed IPv6 input chain exists
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    chain_management: true
+    ip_version: ipv6
+    state: present
+
+- name: Route IPv4 host traffic through the managed chain first
+  ansible.builtin.iptables:
+    chain: INPUT
+    jump: ANSIBLE_INPUT
+    action: insert
+    rule_num: 1
+    state: present
+
+- name: Route IPv6 host traffic through the managed chain first
+  ansible.builtin.iptables:
+    chain: INPUT
+    jump: ANSIBLE_INPUT
+    action: insert
+    rule_num: 1
+    ip_version: ipv6
+    state: present
+
+- name: Allow IPv4 loopback traffic
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    in_interface: lo
+    jump: ACCEPT
+    action: insert
+    rule_num: 1
+    state: present
+
+- name: Allow IPv6 loopback traffic
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    in_interface: lo
+    jump: ACCEPT
+    action: insert
+    rule_num: 1
+    ip_version: ipv6
+    state: present
+
+- name: Allow established IPv4 traffic
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    ctstate:
+      - ESTABLISHED
+      - RELATED
+    jump: ACCEPT
+    action: insert
+    rule_num: 2
+    state: present
+
+- name: Allow established IPv6 traffic
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    ctstate:
+      - ESTABLISHED
+      - RELATED
+    jump: ACCEPT
+    action: insert
+    rule_num: 2
+    ip_version: ipv6
+    state: present
+
+- name: Allow essential IPv4 ICMP
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    protocol: icmp
+    jump: ACCEPT
+    action: insert
+    rule_num: 3
+    state: present
+
+- name: Allow essential IPv6 ICMP
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    protocol: ipv6-icmp
+    jump: ACCEPT
+    action: insert
+    rule_num: 3
+    ip_version: ipv6
+    state: present
+
+- name: Allow IPv4 DHCP client replies
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    protocol: udp
+    source_port: "67"
+    destination_port: "68"
+    jump: ACCEPT
+    action: insert
+    rule_num: 4
+    state: present
+
+- name: Allow IPv6 DHCP client replies
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    protocol: udp
+    source_port: "547"
+    destination_port: "546"
+    jump: ACCEPT
+    action: insert
+    rule_num: 4
+    ip_version: ipv6
+    state: present
+
+- name: Allow the target IPv4 SSH port
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    protocol: tcp
+    destination_port: "{{ ssh_port }}"
+    jump: ACCEPT
+    action: insert
+    rule_num: 5
+    comment: ansible-managed-ssh-target
+    state: present
+
+- name: Allow the target IPv6 SSH port
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    protocol: tcp
+    destination_port: "{{ ssh_port }}"
+    jump: ACCEPT
+    action: insert
+    rule_num: 5
+    comment: ansible-managed-ssh-target
+    ip_version: ipv6
+    state: present
+
+- name: Temporarily allow the current IPv4 SSH port
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    protocol: tcp
+    destination_port: "{{ discovered_ssh_port }}"
+    jump: ACCEPT
+    action: insert
+    rule_num: 6
+    comment: ansible-managed-ssh-transition
+    state: present
+  when: discovered_ssh_port | int != ssh_port | int
+
+- name: Temporarily allow the current IPv6 SSH port
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    protocol: tcp
+    destination_port: "{{ discovered_ssh_port }}"
+    jump: ACCEPT
+    action: insert
+    rule_num: 6
+    comment: ansible-managed-ssh-transition
+    ip_version: ipv6
+    state: present
+  when: discovered_ssh_port | int != ssh_port | int
+
+- name: Drop all other IPv4 host input
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    jump: DROP
+    state: present
+
+- name: Drop all other IPv6 host input
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    jump: DROP
+    ip_version: ipv6
+    state: present
+
+- name: Set the IPv4 host policies
+  ansible.builtin.iptables:
+    chain: "{{ item.chain }}"
+    policy: "{{ item.policy }}"
+  loop:
+    - {chain: INPUT, policy: DROP}
+    - {chain: OUTPUT, policy: ACCEPT}
+
+- name: Set the IPv6 host policies
+  ansible.builtin.iptables:
+    chain: "{{ item.chain }}"
+    policy: "{{ item.policy }}"
+    ip_version: ipv6
+  loop:
+    - {chain: INPUT, policy: DROP}
+    - {chain: OUTPUT, policy: ACCEPT}

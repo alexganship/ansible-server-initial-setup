@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply the Ansible-owned Docker DOCKER-USER policy
+Requires=docker.service
+After=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ansible-docker-user-firewall
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

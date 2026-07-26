@@ -1,0 +1,303 @@
+---
+- name: Define the managed SSH configuration path
+  ansible.builtin.set_fact:
+    managed_sshd_config: /etc/ssh/sshd_config.d/00-ansible-managed.conf
+
+- name: Migrate SSH to the target port
+  when: discovered_ssh_port | int != ssh_port | int
+  block:
+    - name: Inspect the existing managed SSH configuration
+      ansible.builtin.stat:
+        path: "{{ managed_sshd_config }}"
+      register: migration_sshd_dropin
+
+    - name: Back up the existing managed SSH configuration
+      ansible.builtin.slurp:
+        path: "{{ managed_sshd_config }}"
+      register: migration_sshd_dropin_content
+      when: migration_sshd_dropin.stat.exists
+
+    - name: Back up the main SSH configuration
+      ansible.builtin.slurp:
+        path: /etc/ssh/sshd_config
+      register: migration_sshd_main_content
+
+    - name: Ensure Ubuntu loads SSH drop-in configuration
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf\s*$'
+        line: Include /etc/ssh/sshd_config.d/*.conf
+        insertbefore: BOF
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Listen on both SSH ports during migration
+      ansible.builtin.template:
+        src: sshd-migration.conf.j2
+        dest: "{{ managed_sshd_config }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Validate the dual-port SSH configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/sshd
+          - -t
+      changed_when: false
+
+    - name: Activate the dual-port SSH configuration
+      ansible.builtin.include_tasks: restart_ssh.yml
+
+    - name: Independently verify support on the target SSH port
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -i
+          - "{{ controller_private_key_path_expanded }}"
+          - -p
+          - "{{ ssh_port | string }}"
+          - -o
+          - BatchMode=yes
+          - -o
+          - "ConnectTimeout={{ ssh_connect_timeout }}"
+          - -o
+          - "StrictHostKeyChecking={{ ssh_strict_host_key_checking }}"
+          - -o
+          - "UserKnownHostsFile={{ controller_known_hosts_file_expanded }}"
+          - "{{ managed_user }}@{{ ansible_host | default(inventory_hostname) }}"
+          - sudo -n /usr/bin/true
+      delegate_to: localhost
+      become: false
+      register: target_ssh_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Require the independently verified target SSH path
+      ansible.builtin.assert:
+        that:
+          - target_ssh_probe.rc == 0
+        fail_msg: >-
+          The target SSH port did not pass an independent support login and
+          passwordless sudo test.
+
+    - name: Switch Ansible to the target SSH port
+      ansible.builtin.set_fact:
+        ansible_port: "{{ ssh_port }}"
+
+    - name: Reset the old-port SSH connection
+      ansible.builtin.meta: reset_connection
+
+    - name: Wait for Ansible on the target SSH port
+      ansible.builtin.wait_for_connection:
+        delay: 1
+        timeout: 60
+
+  rescue:
+    - name: Restore the previous managed SSH configuration
+      ansible.builtin.copy:
+        dest: "{{ managed_sshd_config }}"
+        content: "{{ migration_sshd_dropin_content.content | b64decode }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: migration_sshd_dropin.stat.exists
+
+    - name: Remove the newly created managed SSH configuration
+      ansible.builtin.file:
+        path: "{{ managed_sshd_config }}"
+        state: absent
+      when: not migration_sshd_dropin.stat.exists
+
+    - name: Restore the main SSH configuration
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config
+        content: "{{ migration_sshd_main_content.content | b64decode }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Validate the restored SSH configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/sshd
+          - -t
+      changed_when: false
+
+    - name: Reactivate the restored SSH configuration
+      ansible.builtin.include_tasks: restart_ssh.yml
+
+    - name: Stop after rolling back the failed SSH migration
+      ansible.builtin.fail:
+        msg: >-
+          SSH migration failed on {{ inventory_hostname }}. The previous SSH
+          configuration was restored and the old firewall allowance remains.
+
+- name: Record an already verified target port
+  ansible.builtin.set_fact:
+    ansible_port: "{{ ssh_port }}"
+  when: discovered_ssh_port | int == ssh_port | int
+
+- name: Apply final public-key-only SSH hardening
+  block:
+    - name: Inspect the pre-hardening managed SSH configuration
+      ansible.builtin.stat:
+        path: "{{ managed_sshd_config }}"
+      register: hardening_sshd_dropin
+
+    - name: Back up the pre-hardening managed SSH configuration
+      ansible.builtin.slurp:
+        path: "{{ managed_sshd_config }}"
+      register: hardening_sshd_dropin_content
+      when: hardening_sshd_dropin.stat.exists
+
+    - name: Back up the pre-hardening main SSH configuration
+      ansible.builtin.slurp:
+        path: /etc/ssh/sshd_config
+      register: hardening_sshd_main_content
+
+    - name: Ensure Ubuntu loads the managed SSH drop-in first
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf\s*$'
+        line: Include /etc/ssh/sshd_config.d/*.conf
+        insertbefore: BOF
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Remove active legacy Port directives from the main SSH file
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^\s*Port\s+[0-9]+\s*(?:#.*)?$'
+        state: absent
+
+    - name: Install the final SSH hardening configuration
+      ansible.builtin.template:
+        src: sshd-managed.conf.j2
+        dest: "{{ managed_sshd_config }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Validate the final SSH configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/sshd
+          - -t
+      changed_when: false
+
+    - name: Activate the final SSH configuration
+      ansible.builtin.include_tasks: restart_ssh.yml
+
+    - name: Independently verify final support login and sudo
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -i
+          - "{{ controller_private_key_path_expanded }}"
+          - -p
+          - "{{ ssh_port | string }}"
+          - -o
+          - BatchMode=yes
+          - -o
+          - "ConnectTimeout={{ ssh_connect_timeout }}"
+          - -o
+          - "StrictHostKeyChecking={{ ssh_strict_host_key_checking }}"
+          - -o
+          - "UserKnownHostsFile={{ controller_known_hosts_file_expanded }}"
+          - "{{ managed_user }}@{{ ansible_host | default(inventory_hostname) }}"
+          - sudo -n /usr/bin/true
+      delegate_to: localhost
+      become: false
+      register: final_ssh_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Require the final independently verified SSH path
+      ansible.builtin.assert:
+        that:
+          - final_ssh_probe.rc == 0
+        fail_msg: "Final support login or passwordless sudo verification failed."
+
+    - name: Read the effective SSH daemon configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/sshd
+          - -T
+      register: effective_sshd_config
+      changed_when: false
+
+    - name: Extract the effective SSH listening ports
+      ansible.builtin.set_fact:
+        effective_sshd_ports: >-
+          {{
+            effective_sshd_config.stdout_lines
+            | select('match', '^port ')
+            | list
+          }}
+
+    - name: Require the effective SSH security settings
+      ansible.builtin.assert:
+        that:
+          - effective_sshd_ports == ['port ' ~ (ssh_port | string)]
+          - "'permitrootlogin no' in effective_sshd_config.stdout_lines"
+          - "'passwordauthentication no' in effective_sshd_config.stdout_lines"
+          - "'kbdinteractiveauthentication no' in effective_sshd_config.stdout_lines"
+          - "'pubkeyauthentication yes' in effective_sshd_config.stdout_lines"
+          - "('allowusers ' ~ managed_user) in effective_sshd_config.stdout_lines"
+          - "'x11forwarding no' in effective_sshd_config.stdout_lines"
+          - "'allowagentforwarding no' in effective_sshd_config.stdout_lines"
+          - >-
+            (
+              'allowtcpforwarding '
+              ~ ('yes' if allow_ssh_tcp_forwarding | bool else 'no')
+            )
+            in effective_sshd_config.stdout_lines
+          - >-
+            ('maxauthtries ' ~ (ssh_max_auth_tries | string))
+            in effective_sshd_config.stdout_lines
+        fail_msg: >-
+          sshd accepted the files, but its effective settings do not match the
+          required port and public-key-only policy.
+
+  rescue:
+    - name: Restore the pre-hardening managed SSH configuration
+      ansible.builtin.copy:
+        dest: "{{ managed_sshd_config }}"
+        content: "{{ hardening_sshd_dropin_content.content | b64decode }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: hardening_sshd_dropin.stat.exists
+
+    - name: Remove the newly created hardening configuration
+      ansible.builtin.file:
+        path: "{{ managed_sshd_config }}"
+        state: absent
+      when: not hardening_sshd_dropin.stat.exists
+
+    - name: Restore the pre-hardening main SSH configuration
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config
+        content: "{{ hardening_sshd_main_content.content | b64decode }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Validate the restored pre-hardening SSH configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/sshd
+          - -t
+      changed_when: false
+
+    - name: Reactivate the pre-hardening SSH configuration
+      ansible.builtin.include_tasks: restart_ssh.yml
+
+    - name: Stop after rolling back failed SSH hardening
+      ansible.builtin.fail:
+        msg: >-
+          Final SSH hardening failed on {{ inventory_hostname }}. The verified
+          pre-hardening configuration was restored.

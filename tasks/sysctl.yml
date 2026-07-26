@@ -1,0 +1,68 @@
+---
+- name: Build the managed network hardening key list
+  ansible.builtin.set_fact:
+    managed_network_sysctl_keys:
+      - net.ipv4.conf.all.accept_redirects
+      - net.ipv4.conf.default.accept_redirects
+      - net.ipv4.conf.all.secure_redirects
+      - net.ipv4.conf.default.secure_redirects
+      - net.ipv4.conf.all.send_redirects
+      - net.ipv4.conf.default.send_redirects
+      - net.ipv4.conf.all.accept_source_route
+      - net.ipv4.conf.default.accept_source_route
+      - net.ipv6.conf.all.accept_redirects
+      - net.ipv6.conf.default.accept_redirects
+      - net.ipv6.conf.all.accept_source_route
+      - net.ipv6.conf.default.accept_source_route
+
+- name: Add live interface network hardening keys
+  ansible.builtin.set_fact:
+    managed_network_sysctl_keys: >-
+      {{
+        managed_network_sysctl_keys
+        + [
+          'net.ipv4.conf.' ~ item ~ '.accept_redirects',
+          'net.ipv4.conf.' ~ item ~ '.secure_redirects',
+          'net.ipv4.conf.' ~ item ~ '.send_redirects',
+          'net.ipv4.conf.' ~ item ~ '.accept_source_route',
+          'net.ipv6.conf.' ~ item ~ '.accept_redirects',
+          'net.ipv6.conf.' ~ item ~ '.accept_source_route'
+        ]
+      }}
+  loop: >-
+    {{
+      ansible_facts["interfaces"]
+      | reject('equalto', 'lo')
+      | select('match', '^[A-Za-z0-9_-]+$')
+      | sort
+      | list
+    }}
+
+- name: Install the managed kernel network hardening policy
+  ansible.builtin.template:
+    src: 99-ansible-security.conf.j2
+    dest: /etc/sysctl.d/99-ansible-security.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Apply kernel network hardening policy
+
+- name: Apply pending kernel network hardening handler
+  ansible.builtin.meta: flush_handlers
+
+- name: Read the effective kernel network hardening values
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/sysctl
+      - -n
+      - "{{ item }}"
+  loop: "{{ managed_network_sysctl_keys }}"
+  register: effective_network_sysctls
+  changed_when: false
+
+- name: Require the effective kernel network hardening policy
+  ansible.builtin.assert:
+    that:
+      - effective_network_sysctls.results | map(attribute='stdout') | unique | list == ['0']
+    fail_msg: >-
+      One or more redirect or source-routing sysctls are not disabled.

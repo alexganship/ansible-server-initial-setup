@@ -1,0 +1,61 @@
+---
+- name: Resolve the Docker apt architecture
+  ansible.builtin.set_fact:
+    docker_apt_architecture: >-
+      {{
+        {
+          'x86_64': 'amd64',
+          'aarch64': 'arm64'
+        }.get(ansible_facts["architecture"], '')
+      }}
+
+- name: Require a Docker-supported architecture
+  ansible.builtin.assert:
+    that:
+      - docker_apt_architecture | length > 0
+    fail_msg: >-
+      Unsupported Docker architecture: {{ ansible_facts["architecture"] }}
+
+- name: Ensure the apt keyring directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the Docker repository signing key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Remove legacy Docker source files that can conflict on Signed-By
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apt/sources.list.d/docker.sources
+    - /etc/apt/sources.list.d/download_docker_com_linux_ubuntu.list
+
+- name: Check the legacy global apt source list
+  ansible.builtin.stat:
+    path: /etc/apt/sources.list
+  register: global_apt_sources
+
+- name: Remove a legacy Docker entry from the global apt source list
+  ansible.builtin.lineinfile:
+    path: /etc/apt/sources.list
+    regexp: '^[^#].*download\.docker\.com/linux/ubuntu.*$'
+    state: absent
+  when: global_apt_sources.stat.exists
+
+- name: Configure one canonical official Docker apt repository
+  ansible.builtin.template:
+    src: docker.list.j2
+    dest: /etc/apt/sources.list.d/docker.list
+    owner: root
+    group: root
+    mode: "0644"

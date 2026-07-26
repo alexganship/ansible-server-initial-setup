@@ -1,0 +1,87 @@
+---
+- name: Keep support in sudo and no other supplementary group
+  ansible.builtin.user:
+    name: "{{ managed_user }}"
+    groups:
+      - sudo
+    append: false
+
+- name: Converge the managed passwordless sudo rule
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/90-{{ managed_user }}"
+    content: "{{ managed_user }} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Keep the support password locked when console passwords are unmanaged
+  ansible.builtin.user:
+    name: "{{ managed_user }}"
+    password_lock: true
+  when: not manage_console_passwords | bool
+
+- name: Update the apt cache and apply the distribution upgrade
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+    upgrade: dist
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  when: upgrade_packages | bool
+
+- name: Install base administration packages
+  ansible.builtin.apt:
+    name: "{{ base_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Disable package-time IPv4 rule capture
+  ansible.builtin.debconf:
+    name: iptables-persistent
+    question: iptables-persistent/autosave_v4
+    value: "false"
+    vtype: boolean
+
+- name: Disable package-time IPv6 rule capture
+  ansible.builtin.debconf:
+    name: iptables-persistent
+    question: iptables-persistent/autosave_v6
+    value: "false"
+    vtype: boolean
+
+- name: Install persistent netfilter support
+  ansible.builtin.apt:
+    name:
+      - iptables-persistent
+      - netfilter-persistent
+    state: present
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Enable netfilter persistence without reloading live rules
+  ansible.builtin.systemd:
+    name: netfilter-persistent.service
+    enabled: true
+
+- name: Read the configured timezone
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/timedatectl
+      - show
+      - --property=Timezone
+      - --value
+  register: configured_timezone
+  changed_when: false
+
+- name: Set the server timezone
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/timedatectl
+      - set-timezone
+      - "{{ timezone }}"
+  when: configured_timezone.stdout != timezone
+  changed_when: true

@@ -1,0 +1,201 @@
+---
+- name: Collect every legacy SSH port from this run
+  ansible.builtin.set_fact:
+    legacy_ssh_ports: >-
+      {{
+        [
+          discovered_ssh_port | int,
+          current_ssh_port | int,
+          bootstrap_ssh_port | int
+        ]
+        | reject('equalto', ssh_port | int)
+        | unique
+        | list
+      }}
+
+- name: Remove legacy IPv4 SSH transition rules
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    protocol: tcp
+    destination_port: "{{ item }}"
+    jump: ACCEPT
+    comment: ansible-managed-ssh-transition
+    state: absent
+  loop: "{{ legacy_ssh_ports }}"
+
+- name: Remove legacy IPv6 SSH transition rules
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    protocol: tcp
+    destination_port: "{{ item }}"
+    jump: ACCEPT
+    comment: ansible-managed-ssh-transition
+    ip_version: ipv6
+    state: absent
+  loop: "{{ legacy_ssh_ports }}"
+
+- name: Remove legacy IPv4 SSH target rules
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    protocol: tcp
+    destination_port: "{{ item }}"
+    jump: ACCEPT
+    comment: ansible-managed-ssh-target
+    state: absent
+  loop: "{{ legacy_ssh_ports }}"
+
+- name: Remove legacy IPv6 SSH target rules
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    protocol: tcp
+    destination_port: "{{ item }}"
+    jump: ACCEPT
+    comment: ansible-managed-ssh-target
+    ip_version: ipv6
+    state: absent
+  loop: "{{ legacy_ssh_ports }}"
+
+- name: Read the pre-finalization live IPv4 host chain
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/iptables
+      - -w
+      - -S
+      - ANSIBLE_INPUT
+  register: pre_final_ipv4_host_chain
+  changed_when: false
+
+- name: Read the pre-finalization live IPv6 host chain
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/ip6tables
+      - -w
+      - -S
+      - ANSIBLE_INPUT
+  register: pre_final_ipv6_host_chain
+  changed_when: false
+
+- name: Remove the IPv4 terminal drop before placing it last
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    jump: DROP
+    state: absent
+  when: pre_final_ipv4_host_chain.stdout_lines | last != '-A ANSIBLE_INPUT -j DROP'
+
+- name: Remove the IPv6 terminal drop before placing it last
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    jump: DROP
+    ip_version: ipv6
+    state: absent
+  when: pre_final_ipv6_host_chain.stdout_lines | last != '-A ANSIBLE_INPUT -j DROP'
+
+- name: Place the IPv4 terminal drop last
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    jump: DROP
+    action: append
+    state: present
+  when: pre_final_ipv4_host_chain.stdout_lines | last != '-A ANSIBLE_INPUT -j DROP'
+
+- name: Place the IPv6 terminal drop last
+  ansible.builtin.iptables:
+    chain: ANSIBLE_INPUT
+    jump: DROP
+    action: append
+    ip_version: ipv6
+    state: present
+  when: pre_final_ipv6_host_chain.stdout_lines | last != '-A ANSIBLE_INPUT -j DROP'
+
+- name: Read the final live IPv4 host chain
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/iptables
+      - -w
+      - -S
+      - ANSIBLE_INPUT
+  register: final_ipv4_host_chain
+  changed_when: false
+
+- name: Read the final live IPv6 host chain
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/ip6tables
+      - -w
+      - -S
+      - ANSIBLE_INPUT
+  register: final_ipv6_host_chain
+  changed_when: false
+
+- name: Require the target rule and terminal drop in both live chains
+  ansible.builtin.assert:
+    that:
+      - >-
+        final_ipv4_host_chain.stdout_lines
+        | select('search', '--dport ' ~ (ssh_port | string))
+        | select('search', 'ansible-managed-ssh-target')
+        | list
+        | length == 1
+      - >-
+        final_ipv6_host_chain.stdout_lines
+        | select('search', '--dport ' ~ (ssh_port | string))
+        | select('search', 'ansible-managed-ssh-target')
+        | list
+        | length == 1
+      - final_ipv4_host_chain.stdout_lines | last == '-A ANSIBLE_INPUT -j DROP'
+      - final_ipv6_host_chain.stdout_lines | last == '-A ANSIBLE_INPUT -j DROP'
+    fail_msg: >-
+      The live host firewall is missing the managed target SSH allowance or its
+      terminal drop is not the final rule.
+
+- name: Require removal of managed legacy SSH allowances
+  ansible.builtin.assert:
+    that:
+      - >-
+        final_ipv4_host_chain.stdout_lines
+        | select('search', '--dport ' ~ (item | string))
+        | select('search', 'ansible-managed-ssh-(target|transition)')
+        | list
+        | length == 0
+      - >-
+        final_ipv6_host_chain.stdout_lines
+        | select('search', '--dport ' ~ (item | string))
+        | select('search', 'ansible-managed-ssh-(target|transition)')
+        | list
+        | length == 0
+    fail_msg: "A managed legacy SSH allowance remains on port {{ item }}."
+  loop: "{{ legacy_ssh_ports }}"
+
+- name: Ensure the persistent netfilter directory exists
+  ansible.builtin.file:
+    path: /etc/iptables
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the persistent IPv4 host policy
+  ansible.builtin.template:
+    src: rules.v4.j2
+    dest: /etc/iptables/rules.v4
+    owner: root
+    group: root
+    mode: "0600"
+    validate: /usr/sbin/iptables-restore --test %s
+
+- name: Install the persistent IPv6 host policy
+  ansible.builtin.template:
+    src: rules.v6.j2
+    dest: /etc/iptables/rules.v6
+    owner: root
+    group: root
+    mode: "0600"
+    validate: /usr/sbin/ip6tables-restore --test %s
+
+- name: Confirm the target SSH port remains reachable
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host | default(inventory_hostname) }}"
+    port: "{{ ssh_port }}"
+    timeout: 15
+  delegate_to: localhost
+  become: false
